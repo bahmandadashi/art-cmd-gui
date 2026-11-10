@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# Never commit ARRI software, LUTs or footage
+art-cmd*/
+ARRIReferenceTool_CMD*/
+*.tar.gz
+*.zip
+*.cube
+*.mxf
+*.mov
+*.mp4
+*.ari
+*.arx
+*.exr
