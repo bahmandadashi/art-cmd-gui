@@ -18,8 +18,12 @@ Features:
     the clip's own metadata; only changed values are sent to art-cmd
     (--parameters JSON). They can optionally be applied to the batch export.
 """
+import atexit
+import colorsys
 import glob
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -27,9 +31,10 @@ import subprocess
 import tempfile
 import threading
 import tkinter as tk
+import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 ARRI_TOOL_PAGE = ("https://www.arri.com/en/learn-help/learn-help-camera-system/"
                   "tools/arri-reference-tool")
 LUT_NAME = "ARRI_LogC4-to-Gamma24_Rec709-D65_v1_65.cube"
@@ -479,6 +484,201 @@ def list_mounts():
     return result
 
 
+# ---------------------------------------------------------------- CDL (color wheels)
+SQ3 = math.sqrt(3.0)
+LUMA = (0.2126, 0.7152, 0.0722)          # Rec.709 luma weights used by ASC CDL saturation
+CDL_LUT_SIZE = 33
+# How far the wheel dot (at the rim) moves the three channels:
+WHEEL_STRENGTH = {"offset": 0.06, "slope": 0.30, "power": 0.30}
+MASTER_RANGE = {"offset": (-0.20, 0.20), "slope": (0.20, 2.00), "power": (0.30, 3.00)}
+MASTER_DEFAULT = {"offset": 0.0, "slope": 1.0, "power": 1.0}
+SAT_RANGE = (0.0, 2.0)
+CDL_NAMES = ("offset", "power", "slope")
+
+_cdl_lock = threading.Lock()
+_cdl_dir = None
+
+
+class CdlState:
+    """Three wheels (offset, power, slope) + saturation, in ASC CDL terms.
+
+    Each wheel has a master value and a dot position (x, y) inside the unit circle.
+    Channel values: offset = master + tint, slope/power = master * (1 + tint), where the
+    tint of the three channels comes from the dot (it always sums to zero).
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.pos = {n: (0.0, 0.0) for n in CDL_NAMES}
+        self.master = dict(MASTER_DEFAULT)
+        self.sat = 1.0
+
+    def reset_wheel(self, name):
+        self.pos[name] = (0.0, 0.0)
+        self.master[name] = MASTER_DEFAULT[name]
+
+    def channels(self, name):
+        x, y = self.pos[name]
+        tint = (x, -x / 2 + SQ3 / 2 * y, -x / 2 - SQ3 / 2 * y)
+        k = WHEEL_STRENGTH[name]
+        m = self.master[name]
+        if name == "offset":
+            return tuple(m + k * t for t in tint)
+        lo = 0.0 if name == "slope" else 0.01
+        return tuple(max(lo, m * (1 + k * t)) for t in tint)
+
+    def values(self):
+        """(slope, offset, power, saturation) as plain tuples."""
+        return (self.channels("slope"), self.channels("offset"),
+                self.channels("power"), float(self.sat))
+
+    def is_identity(self):
+        sl, of, pw, sat = self.values()
+        return (all(abs(v - 1) < 1e-9 for v in sl) and all(abs(v) < 1e-9 for v in of)
+                and all(abs(v - 1) < 1e-9 for v in pw) and abs(sat - 1) < 1e-9)
+
+    def set_from_values(self, slope, offset, power, sat):
+        """Inverse of values(). Returns True if something had to be limited."""
+        limited = False
+        for name, ch in (("slope", slope), ("offset", offset), ("power", power)):
+            m = sum(ch) / 3.0
+            lo, hi = MASTER_RANGE[name]
+            if not lo <= m <= hi:
+                limited = True
+                m = min(max(m, lo), hi)
+            k = WHEEL_STRENGTH[name]
+            if name == "offset":
+                tint = [(c - m) / k for c in ch]
+            else:
+                tint = [((c / m) - 1) / k if m else 0.0 for c in ch]
+            x = (2 * tint[0] - tint[1] - tint[2]) / 3.0
+            y = (tint[1] - tint[2]) / SQ3
+            r = math.hypot(x, y)
+            if r > 1.0:
+                limited = True
+                x, y = x / r, y / r
+            self.master[name] = m
+            self.pos[name] = (x, y)
+        lo, hi = SAT_RANGE
+        if not lo <= sat <= hi:
+            limited = True
+        self.sat = min(max(float(sat), lo), hi)
+        return limited
+
+
+def cdl_apply(rgb, slope, offset, power, sat):
+    """ASC CDL on one RGB triple: slope, offset, power per channel, then saturation."""
+    out = []
+    for c in range(3):
+        v = rgb[c] * slope[c] + offset[c]
+        out.append(v ** power[c] if v > 0 else 0.0)
+    luma = sum(LUMA[i] * out[i] for i in range(3))
+    return [min(max(luma + sat * (o - luma), 0.0), 1.0) for o in out]
+
+
+def cdl_cube_text(values, size=CDL_LUT_SIZE):
+    """A .cube 3D LUT (red changes fastest) that applies the CDL."""
+    slope, offset, power, sat = values
+    grid = [i / (size - 1) for i in range(size)]
+    per_channel = []
+    for c in range(3):
+        col = []
+        for g in grid:
+            v = g * slope[c] + offset[c]
+            col.append(v ** power[c] if v > 0 else 0.0)
+        per_channel.append(col)
+    lines = ["TITLE \"art-gui CDL\"", f"LUT_3D_SIZE {size}",
+             "DOMAIN_MIN 0 0 0", "DOMAIN_MAX 1 1 1"]
+    for b in range(size):
+        vb = per_channel[2][b]
+        for g in range(size):
+            vg = per_channel[1][g]
+            for r in range(size):
+                vr = per_channel[0][r]
+                luma = LUMA[0] * vr + LUMA[1] * vg + LUMA[2] * vb
+                o0 = min(max(luma + sat * (vr - luma), 0.0), 1.0)
+                o1 = min(max(luma + sat * (vg - luma), 0.0), 1.0)
+                o2 = min(max(luma + sat * (vb - luma), 0.0), 1.0)
+                lines.append(f"{o0:.6f} {o1:.6f} {o2:.6f}")
+    return "\n".join(lines) + "\n"
+
+
+def ensure_cdl_lut(values):
+    """Write (once per distinct setting) the CDL LUT and return its path."""
+    global _cdl_dir
+    key = hashlib.md5(repr([[round(v, 6) for v in t] if isinstance(t, tuple) else round(t, 6)
+                            for t in values]).encode()).hexdigest()[:16]
+    with _cdl_lock:
+        if _cdl_dir is None:
+            _cdl_dir = tempfile.mkdtemp(prefix="artcdl_")
+            atexit.register(shutil.rmtree, _cdl_dir, ignore_errors=True)
+        path = os.path.join(_cdl_dir, f"cdl_{key}.cube")
+        if not os.path.exists(path):
+            tmp = path + ".part"
+            with open(tmp, "w", encoding="ascii") as f:
+                f.write(cdl_cube_text(values))
+            os.replace(tmp, path)
+    return path
+
+
+def describe_cdl(values):
+    sl, of, pw, sat = values
+    f = lambda t: " ".join(f"{v:.3f}" for v in t)  # noqa: E731
+    return f"slope {f(sl)} | offset {f(of)} | power {f(pw)} | sat {sat:.3f}"
+
+
+def cdl_to_xml(values):
+    sl, of, pw, sat = values
+    f = lambda t: " ".join(f"{v:.6f}" for v in t)  # noqa: E731
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<ColorDecisionList xmlns="urn:ASC:CDL:v1.01">\n'
+            '  <ColorDecision>\n'
+            '    <ColorCorrection id="art-gui">\n'
+            '      <SOPNode>\n'
+            f'        <Slope>{f(sl)}</Slope>\n'
+            f'        <Offset>{f(of)}</Offset>\n'
+            f'        <Power>{f(pw)}</Power>\n'
+            '      </SOPNode>\n'
+            '      <SatNode>\n'
+            f'        <Saturation>{sat:.6f}</Saturation>\n'
+            '      </SatNode>\n'
+            '    </ColorCorrection>\n'
+            '  </ColorDecision>\n'
+            '</ColorDecisionList>\n')
+
+
+def cdl_from_xml(text):
+    """(slope, offset, power, sat) from an ASC CDL file; ValueError if not understood."""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"Not a valid XML file: {e}")
+
+    def find(tag):
+        for el in root.iter():
+            if el.tag.split("}")[-1] == tag:
+                return el
+        return None
+
+    def triple(tag):
+        el = find(tag)
+        if el is None or not (el.text or "").split():
+            raise ValueError(f"<{tag}> not found")
+        vals = [float(x) for x in el.text.split()]
+        if len(vals) != 3:
+            raise ValueError(f"<{tag}> needs three numbers")
+        return tuple(vals)
+
+    try:
+        sat_el = find("Saturation")
+        sat = float(sat_el.text) if sat_el is not None else 1.0
+        return triple("Slope"), triple("Offset"), triple("Power"), sat
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Could not read the CDL values: {e}")
+
+
 class SliderRow:
     """Label + slider + spinbox kept in sync."""
 
@@ -598,6 +798,7 @@ class PreviewWindow(tk.Toplevel):
         ttk.Checkbutton(opts, text="Auto render", variable=self.var_auto).pack(side="left")
         self.btn_render = ttk.Button(opts, text="Render", command=self.commit)
         self.btn_render.pack(side="left", padx=8)
+        ttk.Button(opts, text="Color wheels", command=self.app.open_cdl).pack(side="left")
 
         # --- processing panel ---
         pf = ttk.LabelFrame(frm, text="Processing (ARRIRAW / ARRICORE clips only)")
@@ -826,11 +1027,13 @@ class PreviewWindow(tk.Toplevel):
         self.var_status.set("Rendering... (art-cmd decodes the frame first)")
         need_meta = clip != self.loaded_clip
         overrides = self.overrides()
+        cdl_values = None if self.app.cdl.is_identity() else self.app.cdl.values()
         threading.Thread(
-            target=self.worker, args=(clip, frame, lut, overrides, need_meta), daemon=True
+            target=self.worker,
+            args=(clip, frame, lut, overrides, need_meta, cdl_values), daemon=True
         ).start()
 
-    def worker(self, clip, frame, lut, overrides, need_meta):
+    def worker(self, clip, frame, lut, overrides, need_meta, cdl_values):
         tmpdir = tempfile.mkdtemp(prefix="artprev_")
         keep_dir = False
         try:
@@ -866,9 +1069,15 @@ class PreviewWindow(tk.Toplevel):
             w = PREVIEW_WIDTH
             base = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
                     "-i", mid]
+            chain = []
+            if cdl_values:
+                chain.append(f"lut3d=file={esc_filter(ensure_cdl_lut(cdl_values))}"
+                             ":interp=tetrahedral")
             if lut:
+                chain.append(f"lut3d=file={esc_filter(lut)}")
+            if chain:
                 fc = (f"[0:v]split=2[a][b];[a]scale={w}:-2[a2];"
-                      f"[b]lut3d=file={esc_filter(lut)},scale={w}:-2[b2]")
+                      f"[b]{','.join(chain)},scale={w}:-2[b2]")
                 cmd = base + ["-filter_complex", fc,
                               "-map", "[a2]", "-frames:v", "1", "-update", "1",
                               "-pix_fmt", "rgb24", before,
@@ -885,7 +1094,7 @@ class PreviewWindow(tk.Toplevel):
 
             keep_dir = True
             info_txt = describe_overrides(overrides) if overrides else None
-            self.safe_after(self.show, tmpdir, before, after if lut else None, frame, info_txt)
+            self.safe_after(self.show, tmpdir, before, after if chain else None, frame, info_txt)
         except Exception as e:  # noqa: BLE001
             self.safe_after(self.fail, f"Error: {e}")
         finally:
@@ -916,13 +1125,197 @@ class PreviewWindow(tk.Toplevel):
                 self.var_status.set(f"Rendered frame {frame}{suffix}")
             else:
                 self.img_after = None
-                self.lbl_after.configure(image="", text="No LUT selected")
-                self.var_status.set(f"Rendered frame {frame} (no LUT selected){suffix}")
+                self.lbl_after.configure(image="", text="No LUT or color change")
+                self.var_status.set(f"Rendered frame {frame} (no LUT or color change){suffix}")
         except tk.TclError as e:
             self.var_status.set(f"Could not display image: {e}")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
             self.finish_render()
+
+
+# ---------------------------------------------------------------- color wheels window
+WHEEL_BG = "#2b2b2b"
+
+
+def make_wheel_image(master, size):
+    """A hue/saturation wheel as a PhotoImage (hue = angle, saturation = radius)."""
+    img = tk.PhotoImage(master=master, width=size, height=size)
+    c = (size - 1) / 2.0
+    radius = c - 1
+    for y in range(size):
+        row = []
+        for x in range(size):
+            dx, dy = x - c, c - y
+            r = math.hypot(dx, dy) / radius
+            if r <= 1.0:
+                h = (math.atan2(dy, dx) / (2 * math.pi)) % 1.0
+                rr, gg, bb = colorsys.hsv_to_rgb(h, r, 1.0)
+                row.append("#%02x%02x%02x" % (int(rr * 255), int(gg * 255), int(bb * 255)))
+            else:
+                row.append(WHEEL_BG)
+        img.put("{" + " ".join(row) + "}", to=(0, y))
+    return img
+
+
+class CdlWindow(tk.Toplevel):
+    """Offset / Power / Slope wheels and saturation (ASC CDL)."""
+
+    SIZE = 160
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.cdl = app.cdl
+        self.title("Color wheels (CDL)")
+        self._lock = False
+        self.wheel_img = make_wheel_image(self, self.SIZE)
+        self.cv, self.dot, self.rgb_lbl = {}, {}, {}
+        self.m_scale, self.m_lbl = {}, {}
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        c = self.SIZE / 2.0
+        for col, name in enumerate(CDL_NAMES):
+            box = ttk.LabelFrame(frm, text=name.capitalize())
+            box.grid(row=0, column=col, padx=6, pady=4, sticky="n")
+            cv = tk.Canvas(box, width=self.SIZE, height=self.SIZE, bg=WHEEL_BG,
+                           highlightthickness=0)
+            cv.pack(padx=8, pady=8)
+            cv.create_image(c, c, image=self.wheel_img)
+            self.dot[name] = cv.create_oval(0, 0, 0, 0, outline="white", width=2)
+            cv.bind("<Button-1>", lambda e, n=name: self.drag(n, e))
+            cv.bind("<B1-Motion>", lambda e, n=name: self.drag(n, e))
+            cv.bind("<ButtonRelease-1>", lambda e: self.app.cdl_changed(commit=True))
+            cv.bind("<Double-Button-1>", lambda e, n=name: self.reset_wheel(n))
+            self.cv[name] = cv
+            self.rgb_lbl[name] = ttk.Label(box, font="TkFixedFont", justify="left")
+            self.rgb_lbl[name].pack(anchor="w", padx=8)
+            lo, hi = MASTER_RANGE[name]
+            row = ttk.Frame(box)
+            row.pack(fill="x", padx=8, pady=4)
+            ttk.Label(row, text="Master").pack(side="left")
+            sc = ttk.Scale(row, from_=lo, to=hi, orient="horizontal", length=90,
+                           command=lambda v, n=name: self.master_moved(n, v))
+            sc.pack(side="left", padx=4)
+            sc.bind("<ButtonRelease-1>", lambda e: self.app.cdl_changed(commit=True))
+            self.m_scale[name] = sc
+            self.m_lbl[name] = ttk.Label(row, width=6, font="TkFixedFont")
+            self.m_lbl[name].pack(side="left")
+            ttk.Button(box, text="Reset", command=lambda n=name: self.reset_wheel(n)).pack(
+                pady=(0, 8))
+
+        srow = ttk.Frame(frm)
+        srow.grid(row=1, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk.Label(srow, text="Saturation").pack(side="left", padx=6)
+        self.sat_scale = ttk.Scale(srow, from_=SAT_RANGE[0], to=SAT_RANGE[1],
+                                   orient="horizontal", length=260, command=self.sat_moved)
+        self.sat_scale.pack(side="left", padx=6)
+        self.sat_scale.bind("<ButtonRelease-1>", lambda e: self.app.cdl_changed(commit=True))
+        self.sat_lbl = ttk.Label(srow, width=6, font="TkFixedFont")
+        self.sat_lbl.pack(side="left")
+
+        ttk.Label(
+            frm, foreground="gray", justify="left",
+            text="Applied to the log image before the LUT. Drag a dot to tint, double-click "
+                 "a wheel to reset it.\nSlope scales, offset adds, power bends the curve "
+                 "(ASC CDL). Saturation uses Rec.709 luma weights.",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=3, sticky="e", pady=8)
+        ttk.Button(btns, text="Reset all", command=self.reset_all).pack(side="left")
+        ttk.Button(btns, text="Load .cdl", command=self.load).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save .cdl", command=self.save).pack(side="left")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="left", padx=6)
+        self.refresh()
+
+    # ----- state <-> widgets
+    def refresh(self):
+        self._lock = True
+        c = self.SIZE / 2.0
+        r = c - 3
+        for name in CDL_NAMES:
+            x, y = self.cdl.pos[name]
+            px, py = c + x * r, c - y * r
+            self.cv[name].coords(self.dot[name], px - 5, py - 5, px + 5, py + 5)
+            ch = self.cdl.channels(name)
+            self.rgb_lbl[name].configure(
+                text="R %.3f\nG %.3f\nB %.3f" % ch)
+            self.m_scale[name].set(self.cdl.master[name])
+            self.m_lbl[name].configure(text=f"{self.cdl.master[name]:.3f}")
+        self.sat_scale.set(self.cdl.sat)
+        self.sat_lbl.configure(text=f"{self.cdl.sat:.2f}")
+        self._lock = False
+
+    def drag(self, name, event):
+        c = self.SIZE / 2.0
+        r = c - 3
+        x, y = (event.x - c) / r, (c - event.y) / r
+        d = math.hypot(x, y)
+        if d > 1.0:
+            x, y = x / d, y / d
+        self.cdl.pos[name] = (x, y)
+        self.refresh()
+        self.app.cdl_changed()
+
+    def master_moved(self, name, value):
+        if self._lock:
+            return
+        self.cdl.master[name] = float(value)
+        self.refresh()
+        self.app.cdl_changed()
+
+    def sat_moved(self, value):
+        if self._lock:
+            return
+        self.cdl.sat = float(value)
+        self.refresh()
+        self.app.cdl_changed()
+
+    def reset_wheel(self, name):
+        self.cdl.reset_wheel(name)
+        self.refresh()
+        self.app.cdl_changed(commit=True)
+
+    def reset_all(self):
+        self.cdl.reset()
+        self.refresh()
+        self.app.cdl_changed(commit=True)
+
+    def load(self):
+        p = filedialog.askopenfilename(
+            parent=self, title="Load CDL",
+            filetypes=[("ASC CDL", "*.cdl *.xml"), ("All files", "*")])
+        if not p:
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                values = cdl_from_xml(f.read())
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            messagebox.showerror("Error", f"Could not load that file:\n{e}", parent=self)
+            return
+        limited = self.cdl.set_from_values(*values)
+        self.refresh()
+        if limited:
+            messagebox.showwarning(
+                "Values limited",
+                "Some values in the file are outside what the wheels can show, so they "
+                "were limited. Saving again will not reproduce the original numbers.",
+                parent=self)
+        self.app.cdl_changed(commit=True)
+
+    def save(self):
+        p = filedialog.asksaveasfilename(
+            parent=self, title="Save CDL", defaultextension=".cdl",
+            filetypes=[("ASC CDL", "*.cdl"), ("All files", "*")])
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(cdl_to_xml(self.cdl.values()))
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not save: {e}", parent=self)
 
 
 # ---------------------------------------------------------------- main app
@@ -964,7 +1357,10 @@ class App(tk.Tk):
         self.var_no_upscale = tk.BooleanVar(value=True)
         self.var_skip = tk.BooleanVar(value=True)
         self.var_apply_proc = tk.BooleanVar(value=False)
-        self.var_proc_info = tk.StringVar(value="Processing settings from Preview: none")
+        self.var_proc_info = tk.StringVar(value="")
+        self.cdl = CdlState()
+        self.cdl_win = None
+        self.var_apply_cdl = tk.BooleanVar(value=False)
         self.var_status = tk.StringVar(value="Ready")
 
         frm = ttk.Frame(self, padding=10)
@@ -1051,8 +1447,12 @@ class App(tk.Tk):
             foreground="gray", justify="left",
         ).grid(row=6, column=1, columnspan=3, sticky="w", padx=6)
 
-        ttk.Checkbutton(frm, text="Skip clips whose output already exists",
-                        variable=self.var_skip).grid(row=7, column=0, columnspan=3, sticky="w")
+        opt7 = ttk.Frame(frm)
+        opt7.grid(row=7, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(opt7, text="Skip clips whose output already exists",
+                        variable=self.var_skip).pack(side="left")
+        ttk.Checkbutton(opt7, text="Apply Color wheels (CDL) to the export",
+                        variable=self.var_apply_cdl).pack(side="left", padx=16)
         ttk.Checkbutton(
             frm, text="Apply Preview processing settings to the export "
                       "(ARRIRAW / ARRICORE clips only)",
@@ -1068,6 +1468,7 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
         ttk.Button(btns, text="Preview", command=self.open_preview).pack(side="left")
+        ttk.Button(btns, text="Color", command=self.open_cdl).pack(side="left", padx=8)
 
         self.pbar = ttk.Progressbar(frm, mode="determinate")
         self.pbar.grid(row=11, column=0, columnspan=4, sticky="ew")
@@ -1083,6 +1484,7 @@ class App(tk.Tk):
 
         self.update_mode()
         self.size_mode_changed(False)
+        self.refresh_info()
         if not ART or not os.path.exists(ART):
             self.write("WARNING: art-cmd not found. Open Settings and select it.\n")
             self.after(400, self.first_run_notice)
@@ -1102,7 +1504,7 @@ class App(tk.Tk):
 
     def set_overrides(self, d):
         self.proc_overrides = dict(d)
-        self.var_proc_info.set("Processing settings from Preview: " + describe_overrides(d))
+        self.refresh_info()
 
     def _lut_changed(self, *_):
         pv = self.preview
@@ -1261,6 +1663,27 @@ class App(tk.Tk):
         if p:
             self.var_lut.set(p)
 
+    def refresh_info(self):
+        cdl = "none" if self.cdl.is_identity() else describe_cdl(self.cdl.values())
+        self.var_proc_info.set(
+            "Processing settings from Preview: " + describe_overrides(self.proc_overrides)
+            + "     Color (CDL): " + cdl)
+
+    def open_cdl(self):
+        if self.cdl_win is not None and self.cdl_win.winfo_exists():
+            self.cdl_win.lift()
+            return
+        self.cdl_win = CdlWindow(self)
+
+    def cdl_changed(self, commit=False):
+        self.refresh_info()
+        pv = self.preview
+        if pv is not None and pv.winfo_exists():
+            if commit:
+                pv.commit()
+            else:
+                pv.schedule_render()
+
     def start_dir(self, var):
         cur = var.get().strip()
         if cur and os.path.isdir(cur):
@@ -1390,6 +1813,8 @@ class App(tk.Tk):
             messagebox.showerror("Error", str(e))
             return
         overrides = dict(self.proc_overrides) if self.var_apply_proc.get() else {}
+        cdl_values = (self.cdl.values()
+                      if self.var_apply_cdl.get() and not self.cdl.is_identity() else None)
         self.cancelled = False
         self.btn_run.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -1399,13 +1824,15 @@ class App(tk.Tk):
                    f"Audio: {self.var_audio.get()}\n")
         if overrides:
             self.write(f"Processing settings: {describe_overrides(overrides)}\n")
+        if cdl_values:
+            self.write(f"Color (CDL): {describe_cdl(cdl_values)}\n")
         if scale_filter:
             self.write(f"Output size: {self.var_size_mode.get()} = "
                        f"{self.var_size_value.get().strip()}"
                        f"{'  (no upscale)' if self.var_no_upscale.get() else ''}\n")
         threading.Thread(
             target=self.worker,
-            args=(jobs, lut, fmt, audio, overrides, scale_filter,
+            args=(jobs, lut, fmt, audio, overrides, scale_filter, cdl_values,
                   os.path.realpath(outdir), self.var_skip.get()),
             daemon=True,
         ).start()
@@ -1430,7 +1857,8 @@ class App(tk.Tk):
             self.write(line)
         return self.proc.wait()
 
-    def convert_one(self, inp, out, lut, fmt, audio, overrides, scale_filter, tmpdir):
+    def convert_one(self, inp, out, lut, fmt, audio, overrides, scale_filter, cdl_path,
+                    tmpdir):
         tmp = os.path.join(tmpdir, "logc.mxf")
         res = os.path.join(tmpdir, "result" + fmt["ext"])
         for f in (tmp, res):
@@ -1470,6 +1898,8 @@ class App(tk.Tk):
             cmd += ["-filter_complex", fcomplex]
         cmd += maps
         vf = []
+        if cdl_path:
+            vf.append(f"lut3d=file={esc_filter(cdl_path)}:interp=tetrahedral")
         if lut:
             vf.append(f"lut3d=file={esc_filter(lut)}")
         if scale_filter:
@@ -1494,12 +1924,14 @@ class App(tk.Tk):
         os.replace(res, out)
         return True
 
-    def worker(self, jobs, lut, fmt, audio, overrides, scale_filter, outroot, skip):
+    def worker(self, jobs, lut, fmt, audio, overrides, scale_filter, cdl_values, outroot,
+               skip):
         done, failed, skipped = [], [], []
         tmpdir = None
         error = None
         try:
             tmpdir = tempfile.mkdtemp(prefix="artgui_", dir=outroot)
+            cdl_path = ensure_cdl_lut(cdl_values) if cdl_values else None
             total = len(jobs)
             for i, (inp, out) in enumerate(jobs, 1):
                 if self.cancelled:
@@ -1512,7 +1944,7 @@ class App(tk.Tk):
                 else:
                     try:
                         ok = self.convert_one(inp, out, lut, fmt, audio, overrides,
-                                              scale_filter, tmpdir)
+                                              scale_filter, cdl_path, tmpdir)
                     except Exception as e:  # noqa: BLE001
                         self.write(f"Error: {e}\n")
                         ok = False

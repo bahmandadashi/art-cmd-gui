@@ -8,10 +8,6 @@ It turns ARRI clips into editing-friendly files in batches, with a before/after 
 > `art-cmd` yourself from ARRI and accept its license (see [ARRI's page](https://www.arri.com/en/learn-help/learn-help-camera-system/tools/arri-reference-tool)).
 > Please read the license that ships with it; its terms are between you and ARRI.
 
-This project was written with the help of Claude, an AI assistant made by Anthropic.
-
-![Main window](screenshots/main-window.png)
-
 ## Features
 
 - Batch conversion of ARRI clips (MXF/ARRIRAW, ARRICORE, ProRes) with `art-cmd`, then `ffmpeg` for the final file
@@ -24,6 +20,8 @@ This project was written with the help of Claude, an AI assistant made by Anthro
 - **Preview** window: any frame before/after the LUT, frame slider with timecode, auto-render when something changes
 - **Processing panel** for ARRIRAW/ARRICORE (exposure index, color temperature, tint, debayer mode). Sliders start at the
   values stored in the clip; only the values you change are sent to `art-cmd` (as a `--parameters` JSON file)
+- **Color wheels** (ASC CDL: offset, power, slope + saturation) in a separate window. The correction is applied to the log image
+  before the LUT, shown live in the preview, and optionally applied to the export. Load and save standard `.cdl` files
 - Drive picker for external disks, hidden folders are hidden in file dialogs
 - A failing clip never stops the batch; failures are listed at the end
 
@@ -59,6 +57,10 @@ Missing tkinter: `sudo dnf install python3-tkinter` (Fedora/Rocky), `sudo apt in
 - **The LUT must match the clip.** A LogC4 LUT is for ALEXA 35 footage; older cameras record LogC3 and need a LogC3 LUT.
 - Processing settings apply to ARRIRAW/ARRICORE only. ProRes clips are not affected (the log says so).
   To use the preview settings in a batch, tick the option in the main window.
+- **Color wheels:** drag a dot to tint, double-click a wheel to reset it. The correction is applied to the log image *before* the
+  display LUT. It affects the export only when "Apply Color wheels (CDL) to the export" is ticked, and then it is the same for
+  every clip in the batch. Negative values are clamped to 0 before the power function and the result is clamped to 0..1;
+  values above 1 are not clamped before the power function, which is the "no clamp" variant of ASC CDL.
 - `.mov` outputs keep the clip's timecode track; `.mp4` outputs do not.
 - Files that `art-cmd` cannot read (for example a `.mov` made by another program) are reported as failed.
 
@@ -70,7 +72,8 @@ using ARRI's public ALEXA 35 sample clips (ProRes and a one-frame ARRIRAW).
 Checked: ProRes 422 HQ and Proxy outputs with a LUT, timecode preserved, stereo/no-audio options, folder mode with sub-folders,
 size by percent, preview and processing panel on ARRIRAW, drive picker.
 
-Not tested yet: DNxHR, ProRes 4444, H.264/H.265 outputs, size by width/height inside the GUI, ARRICORE, multi-frame ARRIRAW,
+Not tested yet: the color wheel window itself (the CDL math, LUT generation and `.cdl` files are unit-tested, but the author has not
+used the window yet), DNxHR, ProRes 4444, H.264/H.265 outputs, size by width/height inside the GUI, ARRICORE, multi-frame ARRIRAW,
 LogC3 workflows, other distributions and desktops.
 
 Known limitations:
@@ -79,14 +82,6 @@ Known limitations:
 - Each preview render runs `art-cmd` on one frame, so it is not real-time playback.
 
 Bug reports and pull requests are welcome.
-
-## Legal note (not legal advice)
-
-ARRI Reference Tool CMD is licensed by ARRI under its own end user license agreement. That agreement is governed
-by German law and says the software is licensed to you as an entrepreneur (professional use), not as a consumer.
-Read it before using the tool. This project only starts `art-cmd` as a separate program; it does not include,
-copy or modify it. The authors are not lawyers. Other laws and terms (for example export or sanctions rules, or the
-terms of a service you use) may also apply to you; please check them yourself.
 
 ## License
 
