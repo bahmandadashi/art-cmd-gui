@@ -17,11 +17,15 @@ It turns ARRI clips into editing-friendly files in batches, with a before/after 
 - Optional `.cube` LUT, for example ARRI's official LogC4 to Rec.709 LUT
 - Audio options: keep, PCM 24/16-bit, AAC, stereo from two mono tracks, or none
 - Output size by width, height or percent, always keeping the aspect ratio (optional "no upscale")
-- **Preview** window: any frame before/after the LUT, frame slider with timecode, auto-render when something changes
+- **One window**: settings on the left, preview on the right with tabs for **Color wheels**, **Processing** and **Info**.
+  The preview shows any frame before/after the LUT, with a frame slider, timecode and auto-render when something changes.
+  Selecting a clip in the list loads it into the preview
 - **Processing panel** for ARRIRAW/ARRICORE (exposure index, color temperature, tint, debayer mode). Sliders start at the
   values stored in the clip; only the values you change are sent to `art-cmd` (as a `--parameters` JSON file)
-- **Color wheels** (ASC CDL: offset, power, slope + saturation) in a separate window. The correction is applied to the log image
+- **Color wheels** (ASC CDL: offset, power, slope + saturation) in the preview tabs. The correction is applied to the log image
   before the LUT, shown live in the preview, and optionally applied to the export. Load and save standard `.cdl` files
+- **Info** tab: file facts (size, date, codec, resolution, frame rate, frames, start timecode) and the full camera metadata
+  that `art-cmd` reads, as a collapsible tree (long lists are cut short)
 - Drive picker for external disks, hidden folders are hidden in file dialogs
 - A failing clip never stops the batch; failures are listed at the end
 
@@ -56,7 +60,7 @@ Missing tkinter: `sudo dnf install python3-tkinter` (Fedora/Rocky), `sudo apt in
 
 - **The LUT must match the clip.** A LogC4 LUT is for ALEXA 35 footage; older cameras record LogC3 and need a LogC3 LUT.
 - Processing settings apply to ARRIRAW/ARRICORE only. ProRes clips are not affected (the log says so).
-  To use the preview settings in a batch, tick the option in the main window.
+  To use these settings in a batch, tick the matching option on the left.
 - **Color wheels:** drag a dot to tint, double-click a wheel to reset it. The correction is applied to the log image *before* the
   display LUT. It affects the export only when "Apply Color wheels (CDL) to the export" is ticked, and then it is the same for
   every clip in the batch. Negative values are clamped to 0 before the power function and the result is clamped to 0..1;
@@ -72,8 +76,11 @@ using ARRI's public ALEXA 35 sample clips (ProRes and a one-frame ARRIRAW).
 Checked: ProRes 422 HQ and Proxy outputs with a LUT, timecode preserved, stereo/no-audio options, folder mode with sub-folders,
 size by percent, preview and processing panel on ARRIRAW, drive picker.
 
-Not tested yet: the color wheel window itself (the CDL math, LUT generation and `.cdl` files are unit-tested, but the author has not
-used the window yet), DNxHR, ProRes 4444, H.264/H.265 outputs, size by width/height inside the GUI, ARRICORE, multi-frame ARRIRAW,
+The single-window layout (0.3.0) was exercised on a virtual display (1920x1080 and 1366x768) with a stand-in for `art-cmd`,
+and the CDL math, LUT generation and `.cdl` files are unit-tested. The author has not yet used this version with real clips.
+Layout is comfortable at 1920x1080; on smaller screens a compact layout is used.
+
+Not tested yet: DNxHR, ProRes 4444, H.264/H.265 outputs, size by width/height inside the GUI, ARRICORE, multi-frame ARRIRAW,
 LogC3 workflows, other distributions and desktops.
 
 Known limitations:

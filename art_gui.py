@@ -30,11 +30,12 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import tkinter as tk
 import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 ARRI_TOOL_PAGE = ("https://www.arri.com/en/learn-help/learn-help-camera-system/"
                   "tools/arri-reference-tool")
 LUT_NAME = "ARRI_LogC4-to-Gamma24_Rec709-D65_v1_65.cube"
@@ -393,8 +394,10 @@ def probe_tc_fps(clip):
 
 def read_clip_info(clip, raw):
     """Camera values (ARRIRAW/ARRICORE only), frame count, fps and start timecode."""
-    info = dict(cam=None, frames=None, fps=None, base=None, tc=None)
+    info = dict(cam=None, frames=None, fps=None, base=None, tc=None, meta=None, probe=None)
     data = export_meta(clip)
+    info["meta"] = data
+    info["probe"] = probe_streams(clip)
     pfps, ptc, pdur = probe_tc_fps(clip)
     meta_fps = parse_rate(find_key(data, "sensorSampleRate")) if data else None
     # For ARRIRAW ffprobe cannot read the stream, so its fps is only a guess.
@@ -419,6 +422,102 @@ def read_clip_info(clip, raw):
         if isinstance(sf, int):
             info["tc"] = fmt_tc(sf, info["base"])
     return info
+
+
+def probe_streams(clip):
+    """First video stream and number of audio streams according to ffprobe."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,width,height,pix_fmt", "-of", "json", clip],
+            capture_output=True, text=True, timeout=30,
+        )
+        streams = json.loads(r.stdout or "{}").get("streams") or []
+    except Exception:  # noqa: BLE001
+        return {"video": None, "audio": None}
+    video = next((x for x in streams if x.get("codec_type") == "video"), None)
+    audio = sum(1 for x in streams if x.get("codec_type") == "audio")
+    return {"video": video, "audio": audio}
+
+
+def human_size(n):
+    if n < 1024:
+        return f"{n} bytes"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}"
+
+
+def file_summary(clip, info):
+    """(name, value) rows for the Info tab. Only facts that were actually read."""
+    rows = []
+    try:
+        st = os.stat(clip)
+        rows += [("File", os.path.basename(clip)), ("Folder", os.path.dirname(clip)),
+                 ("Size", human_size(st.st_size)),
+                 ("Modified", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)))]
+    except OSError:
+        rows.append(("File", clip))
+    pr = info.get("probe") or {}
+    v = pr.get("video")
+    if v:
+        name = v.get("codec_name")
+        rows.append(("Video codec", name if name and name != "none"
+                     else "unknown to ffprobe (normal for ARRIRAW)"))
+        if v.get("width") and v.get("height"):
+            rows.append(("Container size", f"{v['width']} x {v['height']}"))
+        if v.get("pix_fmt"):
+            rows.append(("Pixel format", v["pix_fmt"]))
+    if pr.get("audio") is not None:
+        rows.append(("Audio tracks", str(pr["audio"])))
+    if info.get("frames"):
+        rows.append(("Frames", str(info["frames"])))
+        if info.get("fps"):
+            rows.append(("Duration", f"{info['frames'] / info['fps']:.2f} s"))
+    if info.get("fps"):
+        rows.append(("Frame rate", f"{info['fps']:g} fps"))
+    if info.get("tc"):
+        rows.append(("Start timecode", info["tc"]))
+    meta = info.get("meta") or {}
+    sensor = find_key(meta, "sensorName")
+    if sensor:
+        rows.append(("Sensor", str(sensor)))
+    rect = find_key(meta, "acquisitionRect")
+    if isinstance(rect, dict) and rect.get("width") and rect.get("height"):
+        rows.append(("Recorded area", f"{rect['width']} x {rect['height']}"))
+    cam = info.get("cam")
+    if cam:
+        rows += [("Exposure index", str(cam["ei"])), ("Color temperature", f"{cam['ct']} K"),
+                 ("Tint", f"{cam['tint']:.1f}")]
+    return rows
+
+
+MAX_META_NODES = 6000
+MAX_LIST_ITEMS = 20
+
+
+def add_json_nodes(tree, parent, key, value, counter):
+    """Fill a Treeview with a nested JSON structure (long lists are cut short)."""
+    if counter[0] >= MAX_META_NODES:
+        return
+    counter[0] += 1
+    if isinstance(value, dict):
+        node = tree.insert(parent, "end", text=str(key), values=("",))
+        for k, v in value.items():
+            add_json_nodes(tree, node, k, v, counter)
+    elif isinstance(value, list):
+        node = tree.insert(parent, "end", text=f"{key}  [{len(value)} items]", values=("",))
+        for i, v in enumerate(value[:MAX_LIST_ITEMS]):
+            add_json_nodes(tree, node, f"[{i}]", v, counter)
+        if len(value) > MAX_LIST_ITEMS:
+            tree.insert(node, "end", text="...",
+                        values=(f"{len(value) - MAX_LIST_ITEMS} more not shown",))
+    else:
+        text = str(value)
+        if len(text) > 300:
+            text = text[:300] + "..."
+        tree.insert(parent, "end", text=str(key), values=(text,))
 
 
 def describe_overrides(d):
@@ -741,12 +840,14 @@ class SliderRow:
 
 
 # ---------------------------------------------------------------- preview
-class PreviewWindow(tk.Toplevel):
-    """One frame before (LogC) and after the LUT, plus info and processing panel."""
+class PreviewPanel(ttk.Frame):
+    """Preview area of the main window: one frame before (LogC) and after the LUT,
+    frame controls, and tabs for color wheels, processing and clip info."""
 
-    def __init__(self, app, clip):
-        super().__init__(app)
+    def __init__(self, parent, app, clip):
+        super().__init__(parent)
         self.app = app
+        self.pw = app.preview_width
         self.alive = True
         self.busy = False
         self.pending = False
@@ -754,10 +855,9 @@ class PreviewWindow(tk.Toplevel):
         self.loaded_clip = None
         self.raw_ok = False
         self.defaults = dict(ei=800, ct=5600, tint=0.0)
-        self.info = dict(cam=None, frames=None, fps=None, base=None, tc=None)
+        self.info = dict(cam=None, frames=None, fps=None, base=None, tc=None, meta=None, probe=None)
         self.tc_start = None
         self.tc_drop = False
-        self.title("Preview")
         self.var_clip = tk.StringVar(value=clip or "")
         self.var_status = tk.StringVar(value="")
         self.var_note = tk.StringVar(value="")
@@ -766,10 +866,8 @@ class PreviewWindow(tk.Toplevel):
         self.var_auto = tk.BooleanVar(value=True)
         self.img_before = None
         self.img_after = None
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        frm = ttk.Frame(self, padding=10)
-        frm.pack(fill="both", expand=True)
+        frm = self
         frm.columnconfigure(1, weight=1)
 
         ttk.Label(frm, text="Clip").grid(row=0, column=0, sticky="w")
@@ -798,11 +896,20 @@ class PreviewWindow(tk.Toplevel):
         ttk.Checkbutton(opts, text="Auto render", variable=self.var_auto).pack(side="left")
         self.btn_render = ttk.Button(opts, text="Render", command=self.commit)
         self.btn_render.pack(side="left", padx=8)
-        ttk.Button(opts, text="Color wheels", command=self.app.open_cdl).pack(side="left")
 
-        # --- processing panel ---
-        pf = ttk.LabelFrame(frm, text="Processing (ARRIRAW / ARRICORE clips only)")
-        pf.grid(row=3, column=0, columnspan=4, sticky="ew", pady=6)
+        # --- tabs: color wheels / processing / info ---
+        self.nb = ttk.Notebook(frm)
+        self.nb.grid(row=6, column=0, columnspan=4, sticky="nsew", pady=6)
+        frm.rowconfigure(6, weight=1)
+        self.tab_color = ttk.Frame(self.nb)
+        self.tab_proc = ttk.Frame(self.nb, padding=6)
+        self.tab_info = ttk.Frame(self.nb, padding=4)
+        self.nb.add(self.tab_color, text="Color wheels")
+        self.nb.add(self.tab_proc, text="Processing (ARRIRAW / ARRICORE only)")
+        self.nb.add(self.tab_info, text="Info")
+        self.cdl_panel = CdlPanel(self.tab_color, app)
+        self.cdl_panel.pack(fill="both", expand=True)
+        pf = self.tab_proc
         pf.columnconfigure(1, weight=1)
         self.row_ei = SliderRow(pf, 0, "Exposure Index", EI_RANGE[0], EI_RANGE[1], 10,
                                 lambda v: str(int(round(v))),
@@ -831,20 +938,21 @@ class PreviewWindow(tk.Toplevel):
         lf1.grid(row=0, column=0, padx=4)
         lf2 = ttk.LabelFrame(imgs, text="After (LUT)")
         lf2.grid(row=0, column=1, padx=4)
-        self.lbl_before = ttk.Label(lf1, width=PREVIEW_WIDTH // 8, anchor="center")
+        self.lbl_before = ttk.Label(lf1, width=self.pw // 8, anchor="center")
         self.lbl_before.pack(padx=4, pady=4)
-        self.lbl_after = ttk.Label(lf2, width=PREVIEW_WIDTH // 8, anchor="center")
+        self.lbl_after = ttk.Label(lf2, width=self.pw // 8, anchor="center")
         self.lbl_after.pack(padx=4, pady=4)
 
         ttk.Label(frm, textvariable=self.var_status, wraplength=1000).grid(
             row=5, column=0, columnspan=4, sticky="w")
 
+        self.build_info_tab()
         if clip:
             self.render()
         else:
-            self.var_status.set("Choose a clip, then press Render.")
+            self.var_status.set("Select a clip in the list on the left (or press Choose clip).")
 
-    # ----- window plumbing
+    # ----- plumbing
     def on_close(self):
         self.alive = False
         if self.job is not None:
@@ -852,7 +960,87 @@ class PreviewWindow(tk.Toplevel):
                 self.after_cancel(self.job)
             except Exception:  # noqa: BLE001
                 pass
-        self.destroy()
+
+    def show_tab(self, which):
+        tabs = {"color": self.tab_color, "processing": self.tab_proc, "info": self.tab_info}
+        self.nb.select(tabs[which])
+
+    def load_clip(self, path):
+        """Show another clip (called when the selection in the file list changes)."""
+        if path and path != self.var_clip.get():
+            self.var_clip.set(path)
+            self.loaded_clip = None
+            self.row_frame.set(0)
+            self.render()
+
+    # ----- info tab
+    def build_info_tab(self):
+        t = self.tab_info
+        t.columnconfigure(1, weight=1)
+        t.rowconfigure(0, weight=1)
+        left = ttk.Frame(t)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        self.sum_tree = ttk.Treeview(left, columns=("k", "v"), show="headings", height=8)
+        self.sum_tree.heading("k", text="File")
+        self.sum_tree.heading("v", text="Value")
+        self.sum_tree.column("k", width=130, stretch=False)
+        self.sum_tree.column("v", width=260)
+        ssb = ttk.Scrollbar(left, command=self.sum_tree.yview)
+        self.sum_tree.configure(yscrollcommand=ssb.set)
+        self.sum_tree.grid(row=0, column=0, sticky="ns")
+        ssb.grid(row=0, column=1, sticky="ns")
+        left.rowconfigure(0, weight=1)
+        ttk.Button(left, text="Copy summary", command=self.copy_summary).grid(
+            row=1, column=0, sticky="w", pady=4)
+
+        right = ttk.Frame(t)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+        self.meta_tree = ttk.Treeview(right, columns=("v",), show="tree headings", height=8)
+        self.meta_tree.heading("#0", text="Metadata (read by art-cmd)")
+        self.meta_tree.heading("v", text="Value")
+        self.meta_tree.column("#0", width=260)
+        self.meta_tree.column("v", width=320)
+        msb = ttk.Scrollbar(right, command=self.meta_tree.yview)
+        self.meta_tree.configure(yscrollcommand=msb.set)
+        self.meta_tree.grid(row=0, column=0, sticky="nsew")
+        msb.grid(row=0, column=1, sticky="ns")
+        bar = ttk.Frame(right)
+        bar.grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Button(bar, text="Expand all", command=lambda: self.set_open(True)).pack(side="left")
+        ttk.Button(bar, text="Collapse all", command=lambda: self.set_open(False)).pack(
+            side="left", padx=6)
+        self.summary_rows = []
+
+    def set_open(self, value, parent=""):
+        for item in self.meta_tree.get_children(parent):
+            self.meta_tree.item(item, open=value)
+            self.set_open(value, item)
+
+    def copy_summary(self):
+        text = "\n".join(f"{k}: {v}" for k, v in self.summary_rows)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def fill_info(self, info):
+        clip = self.var_clip.get()
+        self.summary_rows = file_summary(clip, info)
+        for item in self.sum_tree.get_children():
+            self.sum_tree.delete(item)
+        for k, v in self.summary_rows:
+            self.sum_tree.insert("", "end", values=(k, v))
+        for item in self.meta_tree.get_children():
+            self.meta_tree.delete(item)
+        meta = info.get("meta")
+        if isinstance(meta, dict) and meta:
+            counter = [0]
+            for k, v in meta.items():
+                add_json_nodes(self.meta_tree, "", k, v, counter)
+            if counter[0] >= MAX_META_NODES:
+                self.meta_tree.insert("", "end", text="...", values=("list cut short",))
+        else:
+            self.meta_tree.insert("", "end", text="No metadata could be read", values=("",))
 
     def safe_after(self, fn, *args):
         if self.alive:
@@ -956,6 +1144,7 @@ class PreviewWindow(tk.Toplevel):
     def apply_info(self, raw, info):
         """Called in the UI thread after the clip metadata was read."""
         self.info = info
+        self.fill_info(info)
         self.tc_start, self.tc_drop = (None, False)
         if info["tc"] and info["base"]:
             self.tc_start, self.tc_drop = parse_tc(info["tc"], info["base"])
@@ -1066,7 +1255,7 @@ class PreviewWindow(tk.Toplevel):
                 self.safe_after(self.fail, "art-cmd failed:\n" + "\n".join(tail))
                 return
 
-            w = PREVIEW_WIDTH
+            w = self.pw
             base = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
                     "-i", mid]
             chain = []
@@ -1121,11 +1310,14 @@ class PreviewWindow(tk.Toplevel):
             suffix = f"   |   processing: {info_txt}" if info_txt else ""
             if after and os.path.exists(after):
                 self.img_after = tk.PhotoImage(file=after)
-                self.lbl_after.configure(image=self.img_after, text="")
+                self.lbl_after.configure(image=self.img_after, text="", compound="none")
                 self.var_status.set(f"Rendered frame {frame}{suffix}")
             else:
                 self.img_after = None
-                self.lbl_after.configure(image="", text="No LUT or color change")
+                self.blank_after = tk.PhotoImage(width=self.img_before.width(),
+                                                 height=self.img_before.height())
+                self.lbl_after.configure(image=self.blank_after, compound="center",
+                                         text="No LUT or color change")
                 self.var_status.set(f"Rendered frame {frame} (no LUT or color change){suffix}")
         except tk.TclError as e:
             self.var_status.set(f"Could not display image: {e}")
@@ -1158,30 +1350,29 @@ def make_wheel_image(master, size):
     return img
 
 
-class CdlWindow(tk.Toplevel):
-    """Offset / Power / Slope wheels and saturation (ASC CDL)."""
+class CdlPanel(ttk.Frame):
+    """Offset / Power / Slope wheels and saturation (ASC CDL), shown in a tab."""
 
-    SIZE = 160
+    SIZE = 140
+    SCALE_LEN = 80
+    SAT_LEN = 220
 
-    def __init__(self, app):
-        super().__init__(app)
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=6)
         self.app = app
         self.cdl = app.cdl
-        self.title("Color wheels (CDL)")
         self._lock = False
         self.wheel_img = make_wheel_image(self, self.SIZE)
         self.cv, self.dot, self.rgb_lbl = {}, {}, {}
         self.m_scale, self.m_lbl = {}, {}
 
-        frm = ttk.Frame(self, padding=10)
-        frm.pack(fill="both", expand=True)
         c = self.SIZE / 2.0
         for col, name in enumerate(CDL_NAMES):
-            box = ttk.LabelFrame(frm, text=name.capitalize())
-            box.grid(row=0, column=col, padx=6, pady=4, sticky="n")
+            box = ttk.LabelFrame(self, text=name.capitalize())
+            box.grid(row=0, column=col, padx=3, pady=2, sticky="n")
             cv = tk.Canvas(box, width=self.SIZE, height=self.SIZE, bg=WHEEL_BG,
                            highlightthickness=0)
-            cv.pack(padx=8, pady=8)
+            cv.grid(row=0, column=0, padx=6, pady=6)
             cv.create_image(c, c, image=self.wheel_img)
             self.dot[name] = cv.create_oval(0, 0, 0, 0, outline="white", width=2)
             cv.bind("<Button-1>", lambda e, n=name: self.drag(n, e))
@@ -1190,44 +1381,39 @@ class CdlWindow(tk.Toplevel):
             cv.bind("<Double-Button-1>", lambda e, n=name: self.reset_wheel(n))
             self.cv[name] = cv
             self.rgb_lbl[name] = ttk.Label(box, font="TkFixedFont", justify="left")
-            self.rgb_lbl[name].pack(anchor="w", padx=8)
+            self.rgb_lbl[name].grid(row=0, column=1, padx=(0, 8), pady=8, sticky="n")
             lo, hi = MASTER_RANGE[name]
             row = ttk.Frame(box)
-            row.pack(fill="x", padx=8, pady=4)
+            row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
             ttk.Label(row, text="Master").pack(side="left")
-            sc = ttk.Scale(row, from_=lo, to=hi, orient="horizontal", length=90,
+            sc = ttk.Scale(row, from_=lo, to=hi, orient="horizontal", length=self.SCALE_LEN,
                            command=lambda v, n=name: self.master_moved(n, v))
             sc.pack(side="left", padx=4)
             sc.bind("<ButtonRelease-1>", lambda e: self.app.cdl_changed(commit=True))
             self.m_scale[name] = sc
             self.m_lbl[name] = ttk.Label(row, width=6, font="TkFixedFont")
             self.m_lbl[name].pack(side="left")
-            ttk.Button(box, text="Reset", command=lambda n=name: self.reset_wheel(n)).pack(
-                pady=(0, 8))
+            ttk.Button(row, text="Reset", width=6,
+                       command=lambda n=name: self.reset_wheel(n)).pack(side="left", padx=(4, 0))
 
-        srow = ttk.Frame(frm)
-        srow.grid(row=1, column=0, columnspan=3, sticky="ew", pady=6)
+        srow = ttk.Frame(self)
+        srow.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ttk.Label(srow, text="Saturation").pack(side="left", padx=6)
         self.sat_scale = ttk.Scale(srow, from_=SAT_RANGE[0], to=SAT_RANGE[1],
-                                   orient="horizontal", length=260, command=self.sat_moved)
+                                   orient="horizontal", length=self.SAT_LEN, command=self.sat_moved)
         self.sat_scale.pack(side="left", padx=6)
         self.sat_scale.bind("<ButtonRelease-1>", lambda e: self.app.cdl_changed(commit=True))
         self.sat_lbl = ttk.Label(srow, width=6, font="TkFixedFont")
         self.sat_lbl.pack(side="left")
+        ttk.Button(srow, text="Save .cdl", command=self.save).pack(side="right", padx=4)
+        ttk.Button(srow, text="Load .cdl", command=self.load).pack(side="right")
+        ttk.Button(srow, text="Reset all", command=self.reset_all).pack(side="right", padx=6)
 
         ttk.Label(
-            frm, foreground="gray", justify="left",
-            text="Applied to the log image before the LUT. Drag a dot to tint, double-click "
-                 "a wheel to reset it.\nSlope scales, offset adds, power bends the curve "
-                 "(ASC CDL). Saturation uses Rec.709 luma weights.",
+            self, foreground="gray",
+            text="Applied to the log image before the LUT. Drag a dot to tint, "
+                 "double-click a wheel to reset it.",
         ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6)
-
-        btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, columnspan=3, sticky="e", pady=8)
-        ttk.Button(btns, text="Reset all", command=self.reset_all).pack(side="left")
-        ttk.Button(btns, text="Load .cdl", command=self.load).pack(side="left", padx=6)
-        ttk.Button(btns, text="Save .cdl", command=self.save).pack(side="left")
-        ttk.Button(btns, text="Close", command=self.destroy).pack(side="left", padx=6)
         self.refresh()
 
     # ----- state <-> widgets
@@ -1331,7 +1517,23 @@ class App(tk.Tk):
         self.tk.call("set", "::tk::dialog::file::showHiddenBtn", "1")
         self.tk.call("set", "::tk::dialog::file::showHiddenVar", "0")
         self.title("ART CMD GUI (unofficial)")
-        self.geometry("920x820")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        width = min(1700, max(1000, sw - 80))
+        height = min(980, max(680, sh - (45 if sw < 1500 else 100)))
+        self.geometry(f"{width}x{height}")
+        self.minsize(900, 620)
+        # small screens get a more compact layout
+        self.compact = sw < 1500
+        self.left_w = 480 if self.compact else 760
+        # width of each of the two preview images, so both fit next to the left column
+        self.preview_width = max(190, min(520, (width - self.left_w - 100) // 2))
+        if self.compact:
+            self.preview_width = min(self.preview_width, 230)
+        if self.compact:
+            CdlPanel.SIZE = 80
+            CdlPanel.SCALE_LEN = 40
+            CdlPanel.SAT_LEN = 110
+        self.protocol("WM_DELETE_WINDOW", self.on_close_app)
         self.proc = None
         self.cancelled = False
         self.files = []
@@ -1359,17 +1561,29 @@ class App(tk.Tk):
         self.var_apply_proc = tk.BooleanVar(value=False)
         self.var_proc_info = tk.StringVar(value="")
         self.cdl = CdlState()
-        self.cdl_win = None
         self.var_apply_cdl = tk.BooleanVar(value=False)
         self.var_status = tk.StringVar(value="Ready")
 
-        frm = ttk.Frame(self, padding=10)
-        frm.pack(fill="both", expand=True)
+        root = ttk.Frame(self, padding=8)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
+        left = ttk.Frame(root)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        right = ttk.Frame(root)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+        bottom = ttk.Frame(root)
+        bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        bottom.columnconfigure(0, weight=1)
+
+        frm = left
         frm.columnconfigure(1, weight=1)
 
         # --- mode ---
         mrow = ttk.Frame(frm)
-        mrow.grid(row=0, column=0, columnspan=4, sticky="w")
+        mrow.grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(mrow, text="Mode:").pack(side="left")
         ttk.Radiobutton(mrow, text="Files", variable=self.mode, value="files",
                         command=self.update_mode).pack(side="left", padx=8)
@@ -1381,8 +1595,11 @@ class App(tk.Tk):
         # --- files mode ---
         self.f_files = ttk.Frame(frm)
         self.f_files.columnconfigure(0, weight=1)
-        self.listbox = tk.Listbox(self.f_files, height=7, selectmode="extended")
+        self.listbox = tk.Listbox(self.f_files, height=4 if self.compact else 9,
+                                  selectmode="extended",
+                                  exportselection=False)
         self.listbox.grid(row=0, column=0, sticky="ew")
+        self.listbox.bind("<<ListboxSelect>>", self.on_list_select)
         lsb = ttk.Scrollbar(self.f_files, command=self.listbox.yview)
         lsb.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=lsb.set)
@@ -1418,25 +1635,29 @@ class App(tk.Tk):
             row=3, column=3, padx=(6, 0))
 
         ttk.Label(frm, text="Output format").grid(row=4, column=0, sticky="w", pady=4)
-        r4 = ttk.Frame(frm)
-        r4.grid(row=4, column=1, columnspan=3, sticky="w", padx=6)
-        ttk.Combobox(r4, textvariable=self.var_format, state="readonly", width=30,
-                     values=[f["label"] for f in self.formats]).pack(side="left")
-        ttk.Label(r4, text="   Size").pack(side="left")
-        cmb_size = ttk.Combobox(r4, textvariable=self.var_size_mode, state="readonly",
-                                width=13, values=SIZE_MODES)
-        cmb_size.pack(side="left", padx=4)
+        ttk.Combobox(frm, textvariable=self.var_format, state="readonly",
+                     width=22 if self.compact else 34,
+                     values=[f["label"] for f in self.formats]).grid(
+            row=4, column=1, sticky="w", padx=6)
+
+        ttk.Label(frm, text="Size").grid(row=5, column=0, sticky="w", pady=4)
+        r5 = ttk.Frame(frm)
+        r5.grid(row=5, column=1, columnspan=3, sticky="w", padx=6)
+        cmb_size = ttk.Combobox(r5, textvariable=self.var_size_mode, state="readonly",
+                                width=11 if self.compact else 13, values=SIZE_MODES)
+        cmb_size.pack(side="left")
         cmb_size.bind("<<ComboboxSelected>>", lambda e: self.size_mode_changed(True))
-        self.spin_size = ttk.Spinbox(r4, from_=1, to=16384, textvariable=self.var_size_value,
-                                     width=7)
-        self.spin_size.pack(side="left")
-        ttk.Checkbutton(r4, text="No upscale", variable=self.var_no_upscale).pack(
+        self.spin_size = ttk.Spinbox(r5, from_=1, to=16384, textvariable=self.var_size_value,
+                                     width=5 if self.compact else 7)
+        self.spin_size.pack(side="left", padx=4)
+        ttk.Checkbutton(r5, text="No upscale", variable=self.var_no_upscale).pack(
             side="left", padx=6)
 
-        ttk.Label(frm, text="Audio output").grid(row=5, column=0, sticky="w", pady=4)
-        ttk.Combobox(frm, textvariable=self.var_audio, state="readonly", width=44,
+        ttk.Label(frm, text="Audio output").grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Combobox(frm, textvariable=self.var_audio, state="readonly",
+                     width=22 if self.compact else 44,
                      values=[a[0] for a in AUDIO_OPTIONS]).grid(
-            row=5, column=1, sticky="w", padx=6)
+            row=6, column=1, sticky="w", padx=6)
 
         ttk.Label(
             frm,
@@ -1444,42 +1665,44 @@ class App(tk.Tk):
                  "a LogC3 LUT for older cameras.\n"
                  "Timecode track is kept in .mov outputs only. "
                  "PCM options become AAC in .mp4 outputs.",
-            foreground="gray", justify="left",
-        ).grid(row=6, column=1, columnspan=3, sticky="w", padx=6)
+            foreground="gray", justify="left", wraplength=self.left_w - 200,
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 6))
 
-        opt7 = ttk.Frame(frm)
-        opt7.grid(row=7, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(opt7, text="Skip clips whose output already exists",
-                        variable=self.var_skip).pack(side="left")
-        ttk.Checkbutton(opt7, text="Apply Color wheels (CDL) to the export",
-                        variable=self.var_apply_cdl).pack(side="left", padx=16)
+        ttk.Checkbutton(frm, text="Skip clips whose output already exists",
+                        variable=self.var_skip).grid(row=8, column=0, columnspan=4, sticky="w")
+        ttk.Checkbutton(frm, text="Apply Color wheels (CDL) to the export",
+                        variable=self.var_apply_cdl).grid(row=9, column=0, columnspan=4,
+                                                          sticky="w")
         ttk.Checkbutton(
-            frm, text="Apply Preview processing settings to the export "
-                      "(ARRIRAW / ARRICORE clips only)",
+            frm, text=("Apply Processing settings (ARRIRAW only)" if self.compact else
+                       "Apply Processing settings to the export "
+                       "(ARRIRAW / ARRICORE clips only)"),
             variable=self.var_apply_proc,
-        ).grid(row=8, column=0, columnspan=3, sticky="w")
-        ttk.Label(frm, textvariable=self.var_proc_info, foreground="gray").grid(
-            row=9, column=0, columnspan=3, sticky="w", padx=22)
+        ).grid(row=10, column=0, columnspan=4, sticky="w")
+        ttk.Label(frm, textvariable=self.var_proc_info, foreground="gray",
+                  justify="left", wraplength=self.left_w - 200).grid(
+            row=11, column=0, columnspan=4, sticky="w", padx=22, pady=(0, 4))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=10, column=0, columnspan=4, pady=8, sticky="w")
+        btns.grid(row=12, column=0, columnspan=4, pady=8, sticky="w")
         self.btn_run = ttk.Button(btns, text="Run", command=self.start)
         self.btn_run.pack(side="left")
         self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
-        ttk.Button(btns, text="Preview", command=self.open_preview).pack(side="left")
-        ttk.Button(btns, text="Color", command=self.open_cdl).pack(side="left", padx=8)
 
-        self.pbar = ttk.Progressbar(frm, mode="determinate")
-        self.pbar.grid(row=11, column=0, columnspan=4, sticky="ew")
-        ttk.Label(frm, textvariable=self.var_status).grid(
-            row=12, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        # --- preview (right) ---
+        self.preview = PreviewPanel(right, self, None)
+        self.preview.grid(row=0, column=0, sticky="nsew")
 
-        self.log = tk.Text(frm, height=14, wrap="word")
-        self.log.grid(row=13, column=0, columnspan=3, sticky="nsew")
-        frm.rowconfigure(13, weight=1)
-        sb = ttk.Scrollbar(frm, command=self.log.yview)
-        sb.grid(row=13, column=3, sticky="ns")
+        # --- progress and log (bottom) ---
+        self.pbar = ttk.Progressbar(bottom, mode="determinate")
+        self.pbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(bottom, textvariable=self.var_status).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        self.log = tk.Text(bottom, height=3 if self.compact else 6, wrap="word")
+        self.log.grid(row=2, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(bottom, command=self.log.yview)
+        sb.grid(row=2, column=1, sticky="ns")
         self.log.configure(yscrollcommand=sb.set)
 
         self.update_mode()
@@ -1631,11 +1854,25 @@ class App(tk.Tk):
             if p not in self.files:
                 self.files.append(p)
                 self.listbox.insert("end", p)
+        if self.files and self.preview is not None and not self.preview.var_clip.get():
+            self.listbox.selection_clear(0, "end")
+            self.listbox.selection_set(0)
+            self.preview.load_clip(self.files[0])
 
     def remove_files(self):
         for i in reversed(self.listbox.curselection()):
             self.listbox.delete(i)
             del self.files[i]
+
+    def on_list_select(self, _event=None):
+        sel = self.listbox.curselection()
+        if sel and self.preview is not None and sel[0] < len(self.files):
+            self.preview.load_clip(self.files[sel[0]])
+
+    def on_close_app(self):
+        if self.preview is not None:
+            self.preview.on_close()
+        self.destroy()
 
     def clear_files(self):
         self.listbox.delete(0, "end")
@@ -1646,6 +1883,9 @@ class App(tk.Tk):
                                     initialdir=self.start_dir(self.var_infolder))
         if p:
             self.var_infolder.set(p)
+            first = first_clip(p)
+            if first and self.preview is not None:
+                self.preview.load_clip(first)
 
     def pick_outdir(self):
         p = filedialog.askdirectory(title="Select output folder",
@@ -1670,10 +1910,7 @@ class App(tk.Tk):
             + "     Color (CDL): " + cdl)
 
     def open_cdl(self):
-        if self.cdl_win is not None and self.cdl_win.winfo_exists():
-            self.cdl_win.lift()
-            return
-        self.cdl_win = CdlWindow(self)
+        self.preview.show_tab("color")
 
     def cdl_changed(self, commit=False):
         self.refresh_info()
@@ -1718,23 +1955,6 @@ class App(tk.Tk):
         btns.pack(anchor="e")
         ttk.Button(btns, text="Use selected", command=use).pack(side="left")
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="left", padx=6)
-
-    def open_preview(self):
-        if self.preview is not None and self.preview.winfo_exists():
-            self.preview.lift()
-            return
-        clip = None
-        if self.mode.get() == "files":
-            sel = self.listbox.curselection()
-            if sel:
-                clip = self.files[sel[0]]
-            elif self.files:
-                clip = self.files[0]
-        else:
-            root = self.var_infolder.get().strip()
-            if root and os.path.isdir(root):
-                clip = first_clip(root)
-        self.preview = PreviewWindow(self, clip)
 
     # ---------- job list ----------
     def build_jobs(self, outdir, ext):
