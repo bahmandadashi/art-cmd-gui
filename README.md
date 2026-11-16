@@ -8,6 +8,11 @@ It turns ARRI clips into editing-friendly files in batches, with a before/after 
 > `art-cmd` yourself from ARRI and accept its license (see [ARRI's page](https://www.arri.com/en/learn-help/learn-help-camera-system/tools/arri-reference-tool)).
 > Please read the license that ships with it; its terms are between you and ARRI.
 
+This project was written with the help of Claude, an AI assistant made by Anthropic.
+
+![Main window](screenshots/main-window.png)
+*The preview shows a frame from ARRI's public ALEXA 35 sample footage.*
+
 ## Features
 
 - Batch conversion of ARRI clips (MXF/ARRIRAW, ARRICORE, ProRes) with `art-cmd`, then `ffmpeg` for the final file
