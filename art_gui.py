@@ -35,7 +35,7 @@ import tkinter as tk
 import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 ARRI_TOOL_PAGE = ("https://www.arri.com/en/learn-help/learn-help-camera-system/"
                   "tools/arri-reference-tool")
 LUT_NAME = "ARRI_LogC4-to-Gamma24_Rec709-D65_v1_65.cube"
@@ -1734,13 +1734,50 @@ class App(tk.Tk):
         if pv is not None and pv.winfo_exists():
             pv.schedule_render(150)
 
+    def copy_text(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
     def first_run_notice(self):
-        messagebox.showinfo(
-            "ARRI Reference Tool CMD not found",
-            "This program needs ARRI's command-line tool (art-cmd), which is not "
-            "included here.\n\nDownload it from ARRI, read its license, extract it, "
-            "then select the art-cmd program in Settings.\n\n" + ARRI_TOOL_PAGE)
-        self.show_settings()
+        win = tk.Toplevel(self)
+        win.title("ARRI Reference Tool CMD not found")
+        win.transient(self)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(
+            frm, justify="left", wraplength=520,
+            text="This program needs ARRI's command-line tool (art-cmd), which is not "
+                 "included here.\n\nDownload it from ARRI, read its license, extract it, "
+                 "then select the art-cmd program in Settings.",
+        ).pack(anchor="w")
+        addr = ttk.Entry(frm, width=72)
+        addr.insert(0, ARRI_TOOL_PAGE)
+        addr.configure(state="readonly")
+        addr.pack(fill="x", pady=10)
+        note = tk.StringVar()
+
+        def copy():
+            self.copy_text(ARRI_TOOL_PAGE)
+            note.set("Address copied.")
+
+        def go():
+            win.destroy()
+            self.show_settings()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Copy address", command=copy).pack(side="left")
+        ttk.Label(btns, textvariable=note, foreground="gray").pack(side="left", padx=8)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="Open Settings", command=go).pack(side="right", padx=6)
+
+    def forget_art_warning(self):
+        """Remove the 'art-cmd not found' line from the log once art-cmd is set."""
+        while True:
+            pos = self.log.search("WARNING: art-cmd not found", "1.0", "end")
+            if not pos:
+                break
+            self.log.delete(pos, f"{pos} lineend + 1c")
 
     def pick_file(self, var, title, types):
         p = filedialog.askopenfilename(title=title, filetypes=types)
@@ -1773,7 +1810,10 @@ class App(tk.Tk):
             frm, foreground="gray", justify="left", wraplength=620,
             text="art-cmd is ARRI's tool and is not included. Download it from ARRI "
                  "and read its license:\n" + ARRI_TOOL_PAGE,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=8)
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=8)
+        ttk.Button(frm, text="Copy address",
+                   command=lambda: self.copy_text(ARRI_TOOL_PAGE)).grid(
+            row=2, column=2, sticky="e")
 
         def save():
             art, lut = v_art.get().strip(), v_lut.get().strip()
@@ -1805,6 +1845,8 @@ class App(tk.Tk):
                 messagebox.showerror("Error", f"Could not save settings: {e}", parent=win)
                 return
             set_art(art)
+            if art:
+                self.forget_art_warning()
             self.var_lut.set(lut)
             win.destroy()
 
